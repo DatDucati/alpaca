@@ -1,4 +1,4 @@
-// Copyright 2019 The Alpaca Authors
+// Copyright 2019, 2021 The Alpaca Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -54,17 +55,17 @@ func (tp testProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func newDirectProxy() ProxyHandler {
-	return NewProxyHandler(
-		func(r *http.Request) (*url.URL, error) { return nil, nil },
-		nil,
-		func(string) {},
-	)
+	return NewProxyHandler(nil, func(string) {})
 }
 
-func newChildProxy(parent *httptest.Server) ProxyHandler {
-	return NewProxyHandler(func(r *http.Request) (*url.URL, error) {
-		return &url.URL{Host: parent.Listener.Addr().String()}, nil
-	}, nil, func(string) {})
+func newChildProxy(parent *httptest.Server) http.Handler {
+	parentURL := &url.URL{Host: parent.Listener.Addr().String()}
+	childProxy := NewProxyHandler(nil, func(string) {})
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ctx := context.WithValue(req.Context(), contextKeyProxy, parentURL)
+		reqWithProxy := req.WithContext(ctx)
+		childProxy.ServeHTTP(w, reqWithProxy)
+	})
 }
 
 func proxyServer(t *testing.T, proxy *httptest.Server) proxyFunc {
@@ -94,9 +95,7 @@ func TestGetViaProxy(t *testing.T) {
 	requests := make(chan string, 2)
 	server := httptest.NewServer(testServer{requests})
 	defer server.Close()
-	// Proxy request should not go to the mux. The empty mux will always return 404.
-	mux := http.NewServeMux()
-	proxy := httptest.NewServer(testProxy{requests, "proxy", newDirectProxy().WrapHandler(mux)})
+	proxy := httptest.NewServer(testProxy{requests, "proxy", newDirectProxy()})
 	defer proxy.Close()
 	tr := &http.Transport{Proxy: proxyServer(t, proxy)}
 	testGetRequest(t, tr, server.URL)
@@ -109,29 +108,13 @@ func TestGetOverTlsViaProxy(t *testing.T) {
 	requests := make(chan string, 2)
 	server := httptest.NewTLSServer(testServer{requests})
 	defer server.Close()
-	// Proxy request should not go to the mux. The empty mux will always return 404.
-	mux := http.NewServeMux()
-	proxy := httptest.NewServer(testProxy{requests, "proxy", newDirectProxy().WrapHandler(mux)})
+	proxy := httptest.NewServer(testProxy{requests, "proxy", newDirectProxy()})
 	defer proxy.Close()
 	tr := &http.Transport{Proxy: proxyServer(t, proxy), TLSClientConfig: tlsConfig(server)}
 	testGetRequest(t, tr, server.URL)
 	require.Len(t, requests, 2)
 	assert.Equal(t, "CONNECT to proxy", <-requests)
 	assert.Equal(t, "GET to server", <-requests)
-}
-
-func TestGetOriginURLsNotProxied(t *testing.T) {
-	requests := make(chan string, 2)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/origin", func(w http.ResponseWriter, req *http.Request) {
-		_, err := w.Write([]byte("Hello, client\n"))
-		require.NoError(t, err)
-	})
-	proxy := httptest.NewServer(testProxy{requests, "proxy", newDirectProxy().WrapHandler(mux)})
-	defer proxy.Close()
-	testGetRequest(t, &http.Transport{}, proxy.URL+"/origin")
-	require.Len(t, requests, 1)
-	assert.Equal(t, "GET to proxy", <-requests)
 }
 
 func TestGetViaTwoProxies(t *testing.T) {

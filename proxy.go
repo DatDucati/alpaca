@@ -37,25 +37,15 @@ type ProxyHandler struct {
 
 type proxyFunc func(*http.Request) (*url.URL, error)
 
-func NewProxyHandler(proxy proxyFunc, auth *authenticator, block func(string)) ProxyHandler {
-	return ProxyHandler{&http.Transport{Proxy: proxy}, auth, block}
-}
-
-func (ph ProxyHandler) WrapHandler(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		// Pass CONNECT requests and absolute-form URIs to the ProxyHandler.
-		// If the request URL has a scheme, it is an absolute-form URI
-		// (RFC 7230 Section 5.3.2).
-		if req.Method == http.MethodConnect || req.URL.Scheme != "" {
-			ph.ServeHTTP(w, req)
-			return
+func NewProxyHandler(auth *authenticator, block func(string)) ProxyHandler {
+	getProxyFromContext := func(req *http.Request) (*url.URL, error) {
+		if value := req.Context().Value(contextKeyProxy); value != nil {
+			proxy := value.(*url.URL)
+			return proxy, nil
 		}
-		// The request URI is an origin-form or asterisk-form target which we
-		// handle as an origin server (RFC 7230 5.3). authority-form URIs
-		// are only for CONNECT, which has already been dispatched to the
-		// ProxyHandler.
-		next.ServeHTTP(w, req)
-	})
+		return nil, nil
+	}
+	return ProxyHandler{&http.Transport{Proxy: getProxyFromContext}, auth, block}
 }
 
 func (ph ProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -69,22 +59,17 @@ func (ph ProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 func (ph ProxyHandler) handleConnect(w http.ResponseWriter, req *http.Request) {
 	// Establish a connection to the server, or an upstream proxy.
-	u, err := ph.transport.Proxy(req)
 	id := req.Context().Value(contextKeyID)
-	if err != nil {
-		log.Printf("[%d] Error finding proxy for %v: %v", id, req.Host, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
 	var server net.Conn
-	if u == nil {
+	var err error
+	if proxy, _ := ph.transport.Proxy(req); proxy == nil {
 		server, err = net.Dial("tcp", req.Host)
 	} else {
-		server, err = connectViaProxy(req, u.Host, ph.auth)
+		server, err = connectViaProxy(req, proxy.Host, ph.auth)
 		var dialErr *dialError
 		if errors.As(err, &dialErr) {
-			log.Printf("[%d] Temporarily blocking unreachable proxy: %q", id, u.Host)
-			ph.block(u.Host)
+			log.Printf("[%d] Temporarily blocking proxy: %q", id, proxy.Host)
+			ph.block(proxy.Host)
 		}
 	}
 	if err != nil {
@@ -175,7 +160,7 @@ func (ph ProxyHandler) proxyRequest(w http.ResponseWriter, req *http.Request, au
 	resp, err := ph.transport.RoundTrip(req)
 	if err != nil {
 		log.Printf("[%d] Error forwarding request: %v", id, err)
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusBadGateway)
 		var dialErr *dialError
 		if errors.As(err, &dialErr) && dialErr.address != req.Host {
 			log.Printf("[%d] Temporarily blocking unreachable proxy: %q",
@@ -194,7 +179,7 @@ func (ph ProxyHandler) proxyRequest(w http.ResponseWriter, req *http.Request, au
 			resp, err = auth.do(req, ph.transport)
 			if err != nil {
 				log.Printf("[%d] Error forwarding request (with auth): %v", id, err)
-				w.WriteHeader(http.StatusInternalServerError)
+				w.WriteHeader(http.StatusBadGateway)
 				return
 			}
 			defer resp.Body.Close()

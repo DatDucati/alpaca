@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net"
@@ -23,6 +24,8 @@ import (
 	"strings"
 	"sync"
 )
+
+const contextKeyProxy = contextKey("proxy")
 
 type ProxyFinder struct {
 	runner  *PACRunner
@@ -53,7 +56,14 @@ func (pf *ProxyFinder) WrapHandler(next http.Handler) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		pf.checkForUpdates()
-		next.ServeHTTP(w, req)
+		proxy, err := pf.findProxyForRequest(req)
+		if err != nil {
+			log.Printf("[%d] %v", req.Context().Value(contextKeyID), err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		ctx := context.WithValue(req.Context(), contextKeyProxy, proxy)
+		next.ServeHTTP(w, req.WithContext(ctx))
 	})
 }
 
