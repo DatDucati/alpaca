@@ -25,8 +25,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-
-	"github.com/samuong/alpaca/cancelable"
 )
 
 type ProxyHandler struct {
@@ -76,8 +74,12 @@ func (ph ProxyHandler) handleConnect(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 		return
 	}
-	serverCloser := cancelable.NewCloser(server)
-	defer serverCloser.Close()
+	closeInDefer := true
+	defer func() {
+		if closeInDefer {
+			server.Close()
+		}
+	}()
 	// Take over the connection back to the client by hijacking the ResponseWriter.
 	h, ok := w.(http.Hijacker)
 	if !ok {
@@ -91,8 +93,11 @@ func (ph ProxyHandler) handleConnect(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	clientCloser := cancelable.NewCloser(client)
-	defer clientCloser.Close()
+	defer func() {
+		if closeInDefer {
+			client.Close()
+		}
+	}()
 	// Write the response directly to the client connection. If we use Go's ResponseWriter, it
 	// will automatically insert a Content-Length header, which is not allowed in a 2xx CONNECT
 	// response (see https://tools.ietf.org/html/rfc7231#section-4.3.6).
@@ -109,8 +114,7 @@ func (ph ProxyHandler) handleConnect(w http.ResponseWriter, req *http.Request) {
 	// Kick off goroutines to copy data in each direction. Whichever goroutine finishes first
 	// will close the Reader for the other goroutine, forcing any blocked copy to unblock. This
 	// prevents any goroutine from blocking indefinitely (which will leak a file descriptor).
-	serverCloser.Cancel()
-	clientCloser.Cancel()
+	closeInDefer = false
 	go func() { _, _ = io.Copy(server, client); server.Close() }()
 	go func() { _, _ = io.Copy(client, server); client.Close() }()
 }
