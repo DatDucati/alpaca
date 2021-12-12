@@ -85,7 +85,9 @@ func main() {
 
 	// build the handler by wrapping middleware upon middleware
 	var handler http.Handler = &mux
-	handler = RequestLogger(handler)
+	// RequestLogger wraps the ResponseWriter in a statusWriter, which breaks the Hijacker
+	// change this so that proxyMux doesn't embed ServeMux directly
+	//handler = RequestLogger(handler)
 	handler = proxyFinder.WrapHandler(handler)
 	handler = AddContextID(handler)
 
